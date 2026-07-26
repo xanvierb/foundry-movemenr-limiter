@@ -65,11 +65,18 @@ test("a later movement only waits for the unelapsed part of its interval", () =>
   assert.equal(timing.durationMs, 100);
 });
 
-test("an expired token deadline allows the next movement immediately", () => {
+test("an expired token deadline starts a fresh visible animation", () => {
   const timing = scheduleSegment(500, 1, 2, 1200);
 
-  assert.equal(timing.deadline, 1000);
-  assert.equal(timing.durationMs, 0);
+  assert.equal(timing.deadline, 1700);
+  assert.equal(timing.durationMs, 500);
+});
+
+test("large execution delays never produce a zero-duration movement", () => {
+  const timing = scheduleSegment(500, 1, 2, 5000);
+
+  assert.equal(timing.deadline, 5500);
+  assert.equal(timing.durationMs, 500);
 });
 
 test("five seconds at two squares per second commits no more than eleven boundaries", () => {

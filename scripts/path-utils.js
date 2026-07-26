@@ -147,7 +147,15 @@ export function scheduleSegment(deadlineMs, cost, speed, now) {
   const previousDeadline = Number.isFinite(Number(deadlineMs))
     ? Number(deadlineMs)
     : currentTime;
-  const deadline = previousDeadline + minimumSegmentDurationMs(cost, speed);
+  const segmentDurationMs = minimumSegmentDurationMs(cost, speed);
+  const accumulatedDeadline = previousDeadline + segmentDurationMs;
+  // Recover ordinary per-update overhead while the schedule is still current,
+  // but never turn a stale deadline into a zero-duration token jump. After an
+  // idle gap (or unusually large delay), begin a fresh visible animation.
+  const deadline =
+    accumulatedDeadline > currentTime
+      ? accumulatedDeadline
+      : currentTime + segmentDurationMs;
   return {
     deadline,
     durationMs: Math.max(0, deadline - currentTime)
