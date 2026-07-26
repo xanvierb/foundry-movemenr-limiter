@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   minimumSegmentDurationMs,
+  scheduleSegment,
   splitSegmentByCost
 } from "../scripts/path-utils.js";
 
@@ -26,6 +27,27 @@ test("two squares per second requires at least half a second per square", () => 
   assert.equal(minimumSegmentDurationMs(1, 2), 500);
   assert.equal(minimumSegmentDurationMs(2, 2), 1000);
   assert.equal(minimumSegmentDurationMs(0.5, 0.5), 1000);
+});
+
+test("small segments are not slowed by an artificial duration floor", () => {
+  assert.equal(minimumSegmentDurationMs(0.1, 20), 5);
+});
+
+test("cumulative pacing recovers per-segment execution overhead", () => {
+  const costs = Array.from({ length: 6 }, () => 1);
+  const speed = 2;
+  const overheadMs = 100;
+  let now = 0;
+  let deadline = 0;
+
+  for (const cost of costs) {
+    const timing = scheduleSegment(deadline, cost, speed, now);
+    deadline = timing.deadline;
+    now += timing.durationMs + overheadMs;
+  }
+
+  const idealDurationMs = (costs.length / speed) * 1000;
+  assert.equal(now, idealDurationMs + overheadMs);
 });
 
 test("five seconds at two squares per second commits no more than eleven boundaries", () => {

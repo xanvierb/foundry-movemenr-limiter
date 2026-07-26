@@ -92,8 +92,10 @@ Each scene token has its own in-memory token bucket:
 Stored allowance can eliminate a wait before the next small segment, but the
 segment itself is still visually paced at the configured speed. The module
 therefore favors smooth gradual movement over teleporting the whole burst.
-Foundry v14's official per-movement animation-speed option is used to match the
-visual interpolation to this pacing.
+Foundry's per-movement animation options are used to match the visual
+interpolation to this pacing. Segment deadlines are cumulative, so normal
+socket and document-update overhead shortens later animations instead of being
+added to the configured travel time once per segment.
 
 Foundry's measured path cost is divided by the scene's configured distance per
 grid space. A 5 ft grid and a 1.5 m grid therefore both count one orthogonal
@@ -182,9 +184,10 @@ movement is always unrestricted.
 - Foundry v14 multi-level waypoints retain their level value, but unusual
   system/module-specific teleport paths remain programmatic and are not
   intercepted.
-- Foundry v13 does not expose v14's per-movement animation-speed option. Actual
-  document movement remains rate-limited, but especially slow settings can look
-  more stepped than they do on v14.
+- Extremely high configured speeds can still be limited by the time Foundry
+  needs to perform each synchronized document update. The cumulative scheduler
+  compensates for ordinary overhead, but it cannot make an individual database
+  operation complete faster.
 
 ## Compatibility and verification
 

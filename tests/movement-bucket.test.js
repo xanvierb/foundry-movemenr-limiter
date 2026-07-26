@@ -34,3 +34,9 @@ test("an indivisible segment larger than burst creates repayable debt", () => {
   assert.equal(bucket.delayFor(1, 0), 500);
   assert.equal(bucket.delayFor(1, 500), 0);
 });
+
+test("a low burst does not reduce sustained throughput", () => {
+  const bucket = new MovementBucket(20, 0.1, 0);
+  bucket.consume(1.5, 0);
+  assert.equal(bucket.delayFor(1.5, 75), 0);
+});

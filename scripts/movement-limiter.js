@@ -16,10 +16,10 @@ import { MovementBucket } from "./movement-bucket.js";
 import {
   currentPosition,
   deduplicateWaypoints,
-  minimumSegmentDurationMs,
   movementWaypoints,
   sameSpatialPosition,
   sanitizeWaypoint,
+  scheduleSegment,
   splitSegmentByCost
 } from "./path-utils.js";
 import { Settings } from "./settings.js";
@@ -273,6 +273,8 @@ export class MovementLimiter {
     let expected = currentPosition(token);
     const path = this.#buildExecutionPath(token, request.waypoints);
     const key = this.#tokenKey(request.sceneId, request.tokenId);
+    let movementDeadline = MovementBucket.now();
+    let scheduledSpeed = null;
 
     this.#debug("movement accepted", {
       token: token.name,
@@ -356,21 +358,29 @@ export class MovementLimiter {
 
       bucket.configure(speed, Settings.maximumBurst);
       bucket.consume(cost);
-      const durationMs = minimumSegmentDurationMs(cost, speed);
       const startedAt = MovementBucket.now();
+      if (scheduledSpeed !== speed) {
+        movementDeadline = startedAt;
+        scheduledSpeed = speed;
+      }
+      const timing = scheduleSegment(
+        movementDeadline,
+        cost,
+        speed,
+        startedAt
+      );
+      movementDeadline = timing.deadline;
+      const durationMs = timing.durationMs;
       const moveOptions = {
         method: "api",
         autoRotate: request.autoRotate,
-        showRuler: false
-      };
-      if (this.#foundryGeneration() >= 14) {
-        moveOptions.animate = true;
-        moveOptions.animation = {
+        showRuler: false,
+        animate: durationMs > 0,
+        animation: {
           duration: durationMs,
-          movementSpeed: speed,
           linkToMovement: true
-        };
-      }
+        }
+      };
       const moved = await token.move(waypoint, moveOptions);
 
       if (!moved) {
@@ -383,9 +393,9 @@ export class MovementLimiter {
       }
 
       expected = currentPosition(token);
-      const elapsedMs = MovementBucket.now() - startedAt;
-      if (elapsedMs < durationMs) {
-        await this.#delay(durationMs - elapsedMs, state);
+      const remainingMs = movementDeadline - MovementBucket.now();
+      if (remainingMs > 0) {
+        await this.#delay(remainingMs, state);
       }
     }
 
@@ -425,10 +435,11 @@ export class MovementLimiter {
 
     const result = [];
     let from = origin;
-    const maximumSegmentCost = Math.min(
-      MAX_SEGMENT_GRID_SPACES,
-      Settings.maximumBurst
-    );
+    // Segment size is an execution/detail concern, not bucket capacity. The
+    // bucket explicitly supports an indivisible segment exceeding its burst by
+    // creating debt. Tying these together creates tiny fractional updates when
+    // burst is low and makes Foundry update overhead dominate movement speed.
+    const maximumSegmentCost = MAX_SEGMENT_GRID_SPACES;
     for (const to of expanded) {
       const cost = this.#measureGridSpaces(token, from, to);
       const parts = splitSegmentByCost(
@@ -608,13 +619,6 @@ export class MovementLimiter {
 
   #tokenKey(sceneId, tokenId) {
     return `${sceneId ?? "none"}.${tokenId ?? "none"}`;
-  }
-
-  #foundryGeneration() {
-    const generation = Number(
-      game.release?.generation ?? String(game.version ?? "").split(".")[0]
-    );
-    return Number.isFinite(generation) ? generation : 13;
   }
 
   #hasSeenRequest(requestId) {

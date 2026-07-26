@@ -121,7 +121,27 @@ export function splitSegmentByCost(from, to, cost, maximumCost) {
 export function minimumSegmentDurationMs(cost, speed) {
   const normalizedCost = Math.max(0, Number(cost) || 0);
   const normalizedSpeed = Math.max(0.01, Number(speed) || 0.01);
-  return Math.max(50, (normalizedCost / normalizedSpeed) * 1000);
+  return (normalizedCost / normalizedSpeed) * 1000;
+}
+
+/**
+ * Schedule a segment against a cumulative movement deadline.
+ *
+ * Using the previous deadline instead of the current time prevents document
+ * update and socket overhead from being added once per segment. If an earlier
+ * segment finishes late, the next animation is shortened by the same amount.
+ * The token bucket remains responsible for deciding when a segment may begin.
+ */
+export function scheduleSegment(deadlineMs, cost, speed, now) {
+  const currentTime = Number.isFinite(Number(now)) ? Number(now) : 0;
+  const previousDeadline = Number.isFinite(Number(deadlineMs))
+    ? Number(deadlineMs)
+    : currentTime;
+  const deadline = previousDeadline + minimumSegmentDurationMs(cost, speed);
+  return {
+    deadline,
+    durationMs: Math.max(0, deadline - currentTime)
+  };
 }
 
 function interpolate(from, to, ratio) {
