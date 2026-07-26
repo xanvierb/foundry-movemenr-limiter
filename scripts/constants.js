@@ -4,7 +4,6 @@ export const SOCKET_CHANNEL = `module.${MODULE_ID}`;
 export const SETTINGS = Object.freeze({
   ENABLED: "enabled",
   MOVEMENT_SPEED: "movementSpeed",
-  MAXIMUM_BURST: "maximumBurst",
   RESTRICTED_ROLES: "restrictedRoles",
   DISABLE_DURING_COMBAT: "disableDuringCombat",
   SHOW_NOTIFICATION: "showNotification",
@@ -37,6 +36,7 @@ export const INTERACTIVE_MOVEMENT_METHODS = new Set([
 export const NOTIFICATION_COOLDOWN_MS = 1800;
 export const CLIENT_REQUEST_TIMEOUT_MS = 10000;
 export const CLIENT_ACTIVE_TIMEOUT_MS = 10000;
+export const MOVE_SETTLE_GRACE_MS = 500;
 export const STATUS_HEARTBEAT_MS = 2500;
 export const RECENT_REQUEST_TTL_MS = 60000;
 export const MAX_SOCKET_WAYPOINTS = 4096;

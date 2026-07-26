@@ -10,12 +10,14 @@ const WAYPOINT_FIELDS = [
 ];
 
 export function currentPosition(tokenDocument) {
+  const source = tokenDocument?._source ?? tokenDocument ?? {};
   const position = {
-    x: Number(tokenDocument.x),
-    y: Number(tokenDocument.y),
-    elevation: Number(tokenDocument.elevation ?? 0)
+    x: Number(source.x ?? tokenDocument?.x),
+    y: Number(source.y ?? tokenDocument?.y),
+    elevation: Number(source.elevation ?? tokenDocument?.elevation ?? 0)
   };
-  if (tokenDocument.level !== undefined) position.level = tokenDocument.level;
+  const level = source.level ?? tokenDocument?.level;
+  if (level !== undefined) position.level = level;
   return position;
 }
 
@@ -44,7 +46,10 @@ export function sanitizeWaypoint(waypoint) {
     }
   }
 
-  return Number.isFinite(clean.x) || Number.isFinite(clean.y) ? clean : null;
+  const hasMovementCoordinate = ["x", "y", "elevation", "level"].some(
+    (field) => clean[field] !== undefined
+  );
+  return hasMovementCoordinate ? clean : null;
 }
 
 export function movementWaypoints(movement, maximum) {
@@ -86,9 +91,18 @@ export function sameSpatialPosition(a, b, epsilon = 1) {
   );
 }
 
-export function splitSegmentByCost(from, to, cost, maximumCost) {
+export function splitSegmentByCost(
+  from,
+  to,
+  cost,
+  maximumCost,
+  maximumParts = Number.POSITIVE_INFINITY
+) {
   const normalizedCost = Math.max(0, Number(cost) || 0);
-  const parts = Math.max(1, Math.ceil(normalizedCost / maximumCost));
+  const normalizedMaximum = Math.max(0.001, Number(maximumCost) || 0.001);
+  const parts = Math.max(1, Math.ceil(normalizedCost / normalizedMaximum));
+  const partLimit = Math.max(0, Math.floor(Number(maximumParts) || 0));
+  if (parts > partLimit) return null;
   if (parts === 1) return [{ ...to }];
 
   const result = [];
@@ -124,14 +138,37 @@ export function minimumSegmentDurationMs(cost, speed) {
   return (normalizedCost / normalizedSpeed) * 1000;
 }
 
-export function animationSpeedForDuration(cost, durationMs, fallbackSpeed) {
-  const normalizedCost = Math.max(0, Number(cost) || 0);
-  const normalizedDuration = Math.max(0, Number(durationMs) || 0);
-  const normalizedFallback = Math.max(0.01, Number(fallbackSpeed) || 0.01);
-  if (normalizedCost === 0 || normalizedDuration === 0) {
-    return normalizedFallback;
+/**
+ * Convert a Foundry movement measurement into physical grid spaces.
+ *
+ * `cost` is deliberately not used: systems, movement actions, and terrain can
+ * multiply it. Distance is normalized by the scene's distance per grid space,
+ * with Foundry's physical space count as the fallback.
+ */
+export function measuredGridSpaces(
+  measurement,
+  { gridless = false, gridSize = 1, gridDistance = 0 } = {}
+) {
+  const distance = Number(measurement?.distance);
+  const normalizedGridDistance = Math.max(0, Number(gridDistance) || 0);
+  if (
+    !gridless &&
+    Number.isFinite(distance) &&
+    distance > 0 &&
+    normalizedGridDistance > 0
+  ) {
+    return distance / normalizedGridDistance;
   }
-  return normalizedCost / (normalizedDuration / 1000);
+
+  const spaces = Number(measurement?.spaces);
+  if (!gridless && Number.isFinite(spaces) && spaces > 0) return spaces;
+
+  const euclidean = Number(measurement?.euclidean);
+  const normalizedGridSize = Math.max(1, Number(gridSize) || 1);
+  if (Number.isFinite(euclidean) && euclidean > 0) {
+    return euclidean / normalizedGridSize;
+  }
+  return null;
 }
 
 /**
@@ -140,7 +177,7 @@ export function animationSpeedForDuration(cost, durationMs, fallbackSpeed) {
  * Using the previous deadline instead of the current time prevents document
  * update and socket overhead from being added once per segment. If an earlier
  * segment finishes late, the next animation is shortened by the same amount.
- * The token bucket remains responsible for deciding when a segment may begin.
+ * The caller keeps this deadline local to one accepted movement request.
  */
 export function scheduleSegment(deadlineMs, cost, speed, now) {
   const currentTime = Number.isFinite(Number(now)) ? Number(now) : 0;
@@ -148,57 +185,17 @@ export function scheduleSegment(deadlineMs, cost, speed, now) {
     ? Number(deadlineMs)
     : currentTime;
   const segmentDurationMs = minimumSegmentDurationMs(cost, speed);
-  const maximumDeadline = currentTime + segmentDurationMs;
-  let deadline;
-  if (previousDeadline > currentTime) {
-    // A movement attempt made before the existing deadline only waits for the
-    // remaining time. Never append a new full interval to that deadline.
-    deadline = Math.min(previousDeadline, maximumDeadline);
-  } else {
-    const accumulatedDeadline = previousDeadline + segmentDurationMs;
-    // Recover ordinary update overhead while the schedule is still recent. If
-    // it has fully expired, start one fresh visible animation instead of a jump.
-    deadline =
-      accumulatedDeadline > currentTime
-        ? accumulatedDeadline
-        : maximumDeadline;
-  }
+  const accumulatedDeadline = previousDeadline + segmentDurationMs;
+  // Never turn processing overhead into extra movement time. When an earlier
+  // update finishes late, the next segment uses the remaining portion of its
+  // cumulative window (or zero when that window has already elapsed).
+  const deadline = Math.max(
+    currentTime,
+    Math.min(accumulatedDeadline, currentTime + segmentDurationMs)
+  );
   return {
     deadline,
     durationMs: Math.max(0, deadline - currentTime)
-  };
-}
-
-/**
- * Combine allowance waiting and animation under one segment deadline.
- * The time spent waiting for bucket allowance is deducted from the animation,
- * so the limiter never deliberately stacks both durations.
- */
-export function scheduleSegmentExecution(
-  deadlineMs,
-  cost,
-  speed,
-  requestedAt,
-  movementStartedAt
-) {
-  const timing = scheduleSegment(deadlineMs, cost, speed, requestedAt);
-  const normalizedRequest = Number(requestedAt) || 0;
-  const normalizedStart = Math.max(
-    normalizedRequest,
-    Number(movementStartedAt) || 0
-  );
-  const segmentDurationMs = minimumSegmentDurationMs(cost, speed);
-  const allowanceWaitMs = Math.max(0, normalizedStart - normalizedRequest);
-  const maximumAnimationDurationMs = Math.max(
-    0,
-    segmentDurationMs - allowanceWaitMs
-  );
-  return {
-    deadline: timing.deadline,
-    durationMs: Math.min(
-      Math.max(0, timing.deadline - normalizedStart),
-      maximumAnimationDurationMs
-    )
   };
 }
 

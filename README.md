@@ -18,7 +18,7 @@ Modern Foundry provides an official token movement lifecycle:
   performs synchronized movement using Foundry's document update workflow.
 - `TokenDocument.getCompleteMovementPath()` and
   `TokenDocument.measureMovementPath()` expose the final path and Foundry's
-  configured grid/diagonal measurements.
+  configured grid measurements.
 - [`game.users.activeGM`](https://foundryvtt.com/api/v14/classes/foundry.documents.collections.Users.html#activeGM)
   designates one connected GM client for a single-authority workflow.
 
@@ -60,11 +60,10 @@ Open **Game Settings → Configure Settings → Module Settings**.
 | --- | ---: | --- |
 | Enable Movement Limiter | Enabled | Master switch |
 | Movement Speed | 2 squares/sec | Sustained real-time movement rate |
-| Maximum Burst | 2 squares | Maximum stored allowance per token |
 | Restricted Roles | Players only | Which Foundry role constants are restricted |
 | Disable During Combat | Enabled | Started combat encounters use normal Foundry movement |
-| Show Movement-Limit Warnings | Enabled | Shows throttled warnings for movement that is too fast or otherwise rejected |
-| Debug Logging | Disabled | Logs path, allowance, elapsed time, waits, and decisions |
+| Show Movement-Limit Warnings | Enabled | Shows non-critical limiter warnings; critical failures remain visible |
+| Debug Logging | Disabled | Logs path measurements, effective speed, timings, and decisions |
 
 Settings are world settings and changes take effect without restarting Foundry.
 
@@ -80,32 +79,36 @@ unrestricted.
 
 ## How the limiter works
 
-Each scene token has its own in-memory token bucket:
+Each accepted segment owns exactly one time window: physical grid spaces divided
+by `Movement Speed`. The visual animation and the authoritative wait use that
+same deadline, so hidden waiting is never added before or after a full
+animation. Segment deadlines are request-local and cumulative, allowing normal
+socket and document-update overhead to be recovered without carrying stale
+delays into the next request. If an update is already late, the following
+animation is shortened instead of starting a new full wait. Repeated input
+cannot restart the active timer; the latest intent is retained and submitted
+after the current animation.
 
-- Allowance regenerates at `Movement Speed` grid spaces per real second.
-- Allowance is capped at `Maximum Burst`.
-- Waiting for 30 seconds never grants more than the configured burst.
-- Token A and Token B never share allowance, even when owned by the same user.
-- Runtime allowance resets when the designated GM client reloads or the server
-  restarts.
+The requesting client is released as soon as the authority reports completion;
+there is no second local animation grace period. Foundry's movement promise
+also includes document-update bookkeeping, so it receives a small bounded
+settling guard after the animation deadline. That guard is never added to the
+next pacing deadline, and input during it is retained. An operation that still
+does not settle is stopped, so a paused or broken animation cannot lock a token
+forever. Pausing the game also aborts brokered movement immediately.
 
-Stored allowance can eliminate a wait before the next small segment, but the
-segment itself is still visually paced at the configured speed. The module
-therefore favors smooth gradual movement over teleporting the whole burst.
-Foundry's per-movement animation options are used to match the visual
-interpolation to this pacing. Segment deadlines are cumulative, so normal
-socket and document-update overhead shortens later animations instead of being
-added to the configured travel time once per segment. The deadline is retained
-per token between separate movement requests. Clicking again therefore never
-restarts a full movement interval; only the portion that has not elapsed can
-still delay the next movement. The requesting client keeps the token busy until
-its final local movement animation has finished, then releases it immediately.
+Keyboard input queued before a document broadcast is stored as a relative
+step. For example, two rapid right-arrow presses are replayed as `0 → 1` and
+then `1 → 2`, rather than accidentally treating both as the stale absolute
+destination `1`. HUD elevation changes retain the latest horizontal position,
+and stale drag-ruler intermediates are rebuilt from the token's new origin.
 
-Foundry's measured path cost is divided by the scene's configured distance per
-grid space. A 5 ft grid and a 1.5 m grid therefore both count one orthogonal
-space as one square. Foundry's configured diagonal rule and movement-cost
-aggregation are used where available. On gridless scenes, one configured grid
-pixel size is treated as one movement space.
+Foundry's physical path distance is normalized by the scene's distance per grid
+space. Terrain, movement-action, or game-system cost multipliers therefore
+cannot turn one physical square into several limiter seconds. A 5 ft grid and a
+1.5 m grid both count one orthogonal space as one square, while Foundry's
+configured diagonal distance remains intact. On gridless scenes, one configured
+grid pixel size is treated as one movement space.
 
 Long path segments are divided into small real document updates. The module
 also waits for the configured segment duration before committing the next
@@ -125,7 +128,7 @@ As a full GM:
 4. For **Custom speed**, enter that token's squares per second.
 
 The override is stored as flags on that TokenDocument. Duplicating a token also
-duplicates its flags, while each placed copy receives a separate runtime bucket.
+duplicates its flags, while each placed copy is paced independently.
 
 ## Combat and paused games
 
@@ -160,6 +163,8 @@ movement is always unrestricted.
 - The GM marks a token busy before awaiting any movement.
 - Duplicate request IDs are ignored.
 - Every request includes its starting position; stale requests are rejected.
+- Completion statuses include the authority-confirmed final position, so input
+  queued before a slower local document broadcast is rebased correctly.
 - Before every segment, the GM checks that no GM or other module moved the token.
   If the position changed, the queued path stops instead of correcting or
   rubber-banding it.
@@ -167,8 +172,8 @@ movement is always unrestricted.
   GM tab reloads or disconnects, the player's local busy guard expires within
   about ten seconds instead of becoming stale.
 - Token/scene deletion aborts work and removes runtime state.
-- A player reconnecting cannot obtain a second bucket while the same GM remains
-  authoritative.
+- A player reconnecting cannot bypass an active movement owned by the same GM
+  authority.
 
 ## Known limitations
 
@@ -182,9 +187,6 @@ movement is always unrestricted.
 - Sequential path segments can produce more movement-history entries or region
   movement events than one unmodified long move. This is the tradeoff required
   to commit real positions over time.
-- With a maximum burst smaller than Foundry's smallest indivisible grid segment,
-  that segment may temporarily create bucket debt. The debt must regenerate
-  before another segment starts, so the sustained rate is still enforced.
 - Foundry v14 multi-level waypoints retain their level value, but unusual
   system/module-specific teleport paths remain programmatic and are not
   intercepted.
@@ -200,8 +202,10 @@ movement is always unrestricted.
 | v14.365 | Targeted; implementation checked against the official API |
 | v13.350 | Compatibility path checked against the official API |
 
-The included Node tests cover bucket regeneration/capping, independent token
-state, long-segment splitting, pacing bounds, manifest integrity, and matching
+The included Node tests cover physical-space measurement, background-tab timer
+clamping, bounded promise cleanup, relative queued input, v13 movement-ID
+recovery, authority recovery, long-segment splitting, pacing bounds, manifest
+integrity, and matching
 English/Dutch localization keys. They can be run without dependencies:
 
 ```bash

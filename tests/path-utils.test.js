@@ -2,12 +2,83 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  animationSpeedForDuration,
+  currentPosition,
+  measuredGridSpaces,
   minimumSegmentDurationMs,
+  sanitizeWaypoint,
   scheduleSegment,
-  scheduleSegmentExecution,
   splitSegmentByCost
 } from "../scripts/path-utils.js";
+
+test("current position uses source coordinates during an animation", () => {
+  const token = {
+    x: 500,
+    y: 500,
+    elevation: 20,
+    _source: { x: 100, y: 200, elevation: 5, level: "ground" }
+  };
+
+  assert.deepEqual(currentPosition(token), {
+    x: 100,
+    y: 200,
+    elevation: 5,
+    level: "ground"
+  });
+});
+
+test("elevation-only movement waypoints are retained", () => {
+  assert.deepEqual(sanitizeWaypoint({ elevation: 10, checkpoint: true }), {
+    elevation: 10,
+    checkpoint: true
+  });
+});
+
+test("physical spaces take precedence over multiplied movement cost", () => {
+  const spaces = measuredGridSpaces(
+    { cost: 25, distance: 5, spaces: 1, euclidean: 100 },
+    { gridDistance: 5, gridSize: 100 }
+  );
+
+  assert.equal(spaces, 1);
+  assert.equal(minimumSegmentDurationMs(spaces, 1), 1000);
+});
+
+test("scene distance units do not change the number of physical spaces", () => {
+  assert.equal(
+    measuredGridSpaces(
+      { cost: 5, distance: 5, spaces: 1 },
+      { gridDistance: 5, gridSize: 100 }
+    ),
+    1
+  );
+  assert.equal(
+    measuredGridSpaces(
+      { cost: 1.5, distance: 1.5, spaces: 1 },
+      { gridDistance: 1.5, gridSize: 100 }
+    ),
+    1
+  );
+});
+
+test("fractional physical distance is not rounded up to whole spaces", () => {
+  assert.equal(
+    measuredGridSpaces(
+      { cost: 25, distance: 6.25, spaces: 2 },
+      { gridDistance: 5, gridSize: 100 }
+    ),
+    1.25
+  );
+});
+
+test("gridless measurement falls back to configured pixel grid size", () => {
+  assert.equal(
+    measuredGridSpaces(
+      { spaces: 0, distance: 0, euclidean: 150 },
+      { gridless: true, gridSize: 100 }
+    ),
+    1.5
+  );
+});
 
 test("long movement is divided into bounded real position updates", () => {
   const path = splitSegmentByCost(
@@ -25,23 +96,27 @@ test("long movement is divided into bounded real position updates", () => {
   });
 });
 
-test("two squares per second requires at least half a second per square", () => {
-  assert.equal(minimumSegmentDurationMs(1, 2), 500);
-  assert.equal(minimumSegmentDurationMs(2, 2), 1000);
-  assert.equal(minimumSegmentDurationMs(0.5, 0.5), 1000);
+test("path splitting refuses to allocate beyond its hard limit", () => {
+  assert.equal(
+    splitSegmentByCost(
+      { x: 0, y: 0 },
+      { x: 1000000, y: 0 },
+      10000,
+      1,
+      100
+    ),
+    null
+  );
 });
 
-test("small segments are not slowed by an artificial duration floor", () => {
+test("configured speed maps directly to one segment time window", () => {
+  assert.equal(minimumSegmentDurationMs(1, 1), 1000);
+  assert.equal(minimumSegmentDurationMs(1, 2), 500);
+  assert.equal(minimumSegmentDurationMs(0.5, 0.5), 1000);
   assert.equal(minimumSegmentDurationMs(0.1, 20), 5);
 });
 
-test("animation speed is adjusted to the scheduled duration", () => {
-  assert.equal(animationSpeedForDuration(1, 500, 2), 2);
-  assert.equal(animationSpeedForDuration(1, 250, 2), 4);
-  assert.equal(animationSpeedForDuration(1, 0, 2), 2);
-});
-
-test("cumulative pacing recovers per-segment execution overhead", () => {
+test("cumulative pacing recovers ordinary per-segment overhead", () => {
   const costs = Array.from({ length: 6 }, () => 1);
   const speed = 2;
   const overheadMs = 100;
@@ -54,101 +129,41 @@ test("cumulative pacing recovers per-segment execution overhead", () => {
     now += timing.durationMs + overheadMs;
   }
 
-  const idealDurationMs = (costs.length / speed) * 1000;
-  assert.equal(now, idealDurationMs + overheadMs);
+  assert.equal(now, 3100);
 });
 
-test("a later movement only waits for the unelapsed part of its interval", () => {
-  const priorDeadline = 500;
-  const timing = scheduleSegment(priorDeadline, 1, 2, 900);
+test("a future or corrupt deadline can never exceed one segment interval", () => {
+  const now = 900;
+  const intervalMs = minimumSegmentDurationMs(1, 2);
 
-  assert.equal(timing.deadline, 1000);
-  assert.equal(timing.durationMs, 100);
-});
-
-test("a future deadline does not stack another movement interval", () => {
-  const timing = scheduleSegment(1000, 1, 2, 900);
-
-  assert.equal(timing.deadline, 1000);
-  assert.equal(timing.durationMs, 100);
-});
-
-test("a far-future legacy deadline is capped to one interval", () => {
-  const timing = scheduleSegment(5000, 1, 2, 900);
-
-  assert.equal(timing.deadline, 1400);
-  assert.equal(timing.durationMs, 500);
-});
-
-test("bucket waiting consumes animation time instead of stacking", () => {
-  const requestedAt = 1000;
-  const bucketWaitMs = 300;
-  const timing = scheduleSegmentExecution(
-    1000,
-    1,
-    2,
-    requestedAt,
-    requestedAt + bucketWaitMs
-  );
-
-  assert.equal(timing.durationMs, 200);
-  assert.equal(bucketWaitMs + timing.durationMs, 500);
-});
-
-test("allowance wait plus animation never exceeds one configured interval", () => {
-  const requestedAt = 10000;
-
-  for (const speed of [0.1, 0.5, 2, 6, 20]) {
-    for (const cost of [0.1, 0.5, 1, 1.5]) {
-      const intervalMs = minimumSegmentDurationMs(cost, speed);
-      const previousDeadlines = [
-        requestedAt - intervalMs * 10,
-        requestedAt - intervalMs / 2,
-        requestedAt,
-        requestedAt + intervalMs / 2,
-        requestedAt + intervalMs,
-        requestedAt + intervalMs * 10
-      ];
-      const allowanceWaits = [0, intervalMs / 4, intervalMs / 2, intervalMs];
-
-      for (const previousDeadline of previousDeadlines) {
-        for (const allowanceWaitMs of allowanceWaits) {
-          const timing = scheduleSegmentExecution(
-            previousDeadline,
-            cost,
-            speed,
-            requestedAt,
-            requestedAt + allowanceWaitMs
-          );
-          const totalLimiterTimeMs = allowanceWaitMs + timing.durationMs;
-          const roundingToleranceMs = Math.max(1e-9, intervalMs * 1e-12);
-          assert.ok(timing.durationMs >= 0);
-          assert.ok(
-            totalLimiterTimeMs <= intervalMs + roundingToleranceMs,
-            `${cost} spaces at ${speed}/s stacked to ${totalLimiterTimeMs}ms (limit ${intervalMs}ms)`
-          );
-        }
-      }
-    }
+  for (const priorDeadline of [901, 1000, 5000, Number.POSITIVE_INFINITY]) {
+    const timing = scheduleSegment(priorDeadline, 1, 2, now);
+    assert.ok(timing.durationMs >= 0);
+    assert.ok(timing.durationMs <= intervalMs);
   }
 });
 
-test("an expired token deadline starts a fresh visible animation", () => {
-  const timing = scheduleSegment(500, 1, 2, 1200);
-
-  assert.equal(timing.deadline, 1700);
-  assert.equal(timing.durationMs, 500);
-});
-
-test("large execution delays never produce a zero-duration movement", () => {
+test("a stale deadline never adds a fresh interval after processing overhead", () => {
   const timing = scheduleSegment(500, 1, 2, 5000);
 
-  assert.equal(timing.deadline, 5500);
-  assert.equal(timing.durationMs, 500);
+  assert.equal(timing.deadline, 5000);
+  assert.equal(timing.durationMs, 0);
 });
 
-test("five seconds at two squares per second commits no more than eleven boundaries", () => {
-  const duration = minimumSegmentDurationMs(1, 2);
-  const commitTimes = Array.from({ length: 30 }, (_, index) => index * duration);
-  assert.equal(commitTimes.filter((time) => time <= 5000).length, 11);
+test("every segment in a mixed path remains bounded by its own interval", () => {
+  const speed = 1;
+  const costs = [1.5, 0.1, 1, 0.4];
+  let now = 1000;
+  let deadline = now;
+
+  for (const cost of costs) {
+    const intervalMs = minimumSegmentDurationMs(cost, speed);
+    const timing = scheduleSegment(deadline, cost, speed, now);
+    assert.ok(timing.durationMs > 0);
+    assert.ok(timing.durationMs <= intervalMs);
+    deadline = timing.deadline;
+    now = deadline;
+  }
+
+  assert.equal(now, 4000);
 });

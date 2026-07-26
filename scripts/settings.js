@@ -35,21 +35,6 @@ export class Settings {
       onChange: changed
     });
 
-    game.settings.register(MODULE_ID, SETTINGS.MAXIMUM_BURST, {
-      name: "MRL.Settings.MaximumBurst.Name",
-      hint: "MRL.Settings.MaximumBurst.Hint",
-      scope: "world",
-      config: true,
-      type: Number,
-      default: 2,
-      range: {
-        min: 0.1,
-        max: 20,
-        step: 0.1
-      },
-      onChange: changed
-    });
-
     game.settings.register(MODULE_ID, SETTINGS.RESTRICTED_ROLES, {
       name: "MRL.Settings.RestrictedRoles.Name",
       hint: "MRL.Settings.RestrictedRoles.Hint",
@@ -104,13 +89,6 @@ export class Settings {
   static get movementSpeed() {
     return Settings.#positiveNumber(
       game.settings.get(MODULE_ID, SETTINGS.MOVEMENT_SPEED),
-      2
-    );
-  }
-
-  static get maximumBurst() {
-    return Settings.#positiveNumber(
-      game.settings.get(MODULE_ID, SETTINGS.MAXIMUM_BURST),
       2
     );
   }

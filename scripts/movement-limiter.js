@@ -6,33 +6,43 @@ import {
   MAX_SEGMENT_GRID_SPACES,
   MAX_SOCKET_WAYPOINTS,
   MODULE_ID,
+  MOVE_SETTLE_GRACE_MS,
   NOTIFICATION_COOLDOWN_MS,
   POSITION_EPSILON_PX,
   RECENT_REQUEST_TTL_MS,
   SOCKET_CHANNEL,
   STATUS_HEARTBEAT_MS
 } from "./constants.js";
-import { MovementBucket } from "./movement-bucket.js";
+import { delayUntil, monotonicNow, settleWithin } from "./async-utils.js";
 import {
-  animationSpeedForDuration,
   currentPosition,
   deduplicateWaypoints,
+  measuredGridSpaces,
   movementWaypoints,
   sameSpatialPosition,
   sanitizeWaypoint,
-  scheduleSegmentExecution,
+  scheduleSegment,
   splitSegmentByCost
 } from "./path-utils.js";
 import { Settings } from "./settings.js";
 
 export class MovementLimiter {
-  #buckets = new Map();
-  #movementDeadlines = new Map();
   #activeMoves = new Map();
   #clientMoves = new Map();
   #lastNotificationAt = 0;
   #recentRequestIds = new Map();
   #socketReady = false;
+  #timings;
+
+  constructor(timings = {}) {
+    this.#timings = {
+      clientRequestTimeoutMs: CLIENT_REQUEST_TIMEOUT_MS,
+      clientActiveTimeoutMs: CLIENT_ACTIVE_TIMEOUT_MS,
+      moveSettleGraceMs: MOVE_SETTLE_GRACE_MS,
+      statusHeartbeatMs: STATUS_HEARTBEAT_MS,
+      ...timings
+    };
+  }
 
   ready() {
     if (this.#socketReady) return;
@@ -45,7 +55,6 @@ export class MovementLimiter {
     const module = game.modules.get(MODULE_ID);
     if (module) {
       module.api = {
-        resetBuckets: () => this.resetBuckets(),
         isTokenRestricted: (token, user) =>
           Settings.isTokenRestricted(token, user)
       };
@@ -72,8 +81,11 @@ export class MovementLimiter {
     }
   }
 
-  resetBuckets() {
-    this.#buckets.clear();
+  onPauseChanged(paused) {
+    if (!paused) return;
+    for (const state of this.#activeMoves.values()) {
+      this.#abort(state, "paused");
+    }
   }
 
   onCanvasReady() {
@@ -82,8 +94,6 @@ export class MovementLimiter {
 
   onDeleteToken(tokenDocument) {
     const key = this.#tokenKey(tokenDocument.parent?.id, tokenDocument.id);
-    this.#buckets.delete(key);
-    this.#movementDeadlines.delete(key);
     globalThis.clearTimeout(this.#clientMoves.get(key)?.timeout);
     this.#clientMoves.delete(key);
     const active = this.#activeMoves.get(key);
@@ -92,8 +102,6 @@ export class MovementLimiter {
 
   onDeleteScene(sceneDocument) {
     const prefix = `${sceneDocument.id}.`;
-    this.#deleteKeysWithPrefix(this.#buckets, prefix);
-    this.#deleteKeysWithPrefix(this.#movementDeadlines, prefix);
     for (const [key, pending] of this.#clientMoves) {
       if (!key.startsWith(prefix)) continue;
       globalThis.clearTimeout(pending.timeout);
@@ -103,6 +111,26 @@ export class MovementLimiter {
       if (!key.startsWith(prefix)) continue;
       this.#abort(active, "unavailable");
     }
+  }
+
+  onMoveToken(tokenDocument, movement, operation, user) {
+    const key = this.#tokenKey(tokenDocument.parent?.id, tokenDocument.id);
+    const active = this.#activeMoves.get(key);
+    if (!active?.currentDestination || movement?.method !== "api") return;
+
+    const initiatingUserId =
+      user?.id ?? movement?.user?.id ?? movement?.user ?? operation?.userId;
+    if (initiatingUserId && initiatingUserId !== game.user.id) return;
+
+    // v13 can generate its own movement ID even if one is supplied to move().
+    // Capture its real ID and constrained destination from the authoritative
+    // hook so timeout cleanup still owns the correct operation.
+    active.currentMovementId = movement.id ?? tokenDocument.movement?.id ?? null;
+    active.currentDestination =
+      this.#materializePosition(
+        movement.destination,
+        active.currentDestination
+      ) ?? active.currentDestination;
   }
 
   onPreMoveToken(tokenDocument, movement, operation) {
@@ -120,58 +148,245 @@ export class MovementLimiter {
       const key = this.#tokenKey(sceneId, tokenId);
       if (!sceneId || !tokenId) return false;
 
-      if (this.#clientMoves.has(key)) {
-        this.#notify("MRL.Notifications.Limited");
-        this.#debugRejected(tokenDocument, movement, "client movement already pending");
+      const intent = this.#captureClientIntent(
+        tokenDocument,
+        movement,
+        waypoints
+      );
+      if (!intent) return false;
+
+      const pending = this.#clientMoves.get(key);
+      if (pending) {
+        // Keep at most the latest intent. Repeated keyboard input no longer
+        // disappears silently and, importantly, never changes the active
+        // request's deadline.
+        pending.queuedIntent = intent;
+        this.#debugRejected(
+          tokenDocument,
+          movement,
+          "client movement queued behind active request"
+        );
         return false;
       }
 
-      const authority = game.users.activeGM;
-      if (!authority) {
-        this.#notify("MRL.Notifications.NoActiveGM");
-        this.#debugRejected(tokenDocument, movement, "no active GM");
-        return false;
-      }
-
-      const requestId = foundry.utils.randomID();
-      const request = {
-        type: "move-request",
-        requestId,
-        userId: game.user.id,
-        sceneId,
-        tokenId,
-        origin: sanitizeWaypoint(movement.origin) ?? currentPosition(tokenDocument),
-        waypoints,
-        autoRotate: Boolean(movement.autoRotate),
-        requestedMethod: movement.method
-      };
-
-      const timeout = globalThis.setTimeout(() => {
-        const pending = this.#clientMoves.get(key);
-        if (pending?.requestId !== requestId) return;
-        this.#clientMoves.delete(key);
-        this.#notify("MRL.Notifications.Denied");
-      }, CLIENT_REQUEST_TIMEOUT_MS);
-      this.#clientMoves.set(key, { requestId, timeout, status: "pending" });
-
-      if (authority.id === game.user.id) {
-        queueMicrotask(() => void this.#handleMoveRequest(request));
-      } else {
-        game.socket.emit(SOCKET_CHANNEL, request);
-      }
-
-      this.#debug("movement request intercepted", {
-        token: tokenDocument.name,
-        requestedDistance: this.#movementGridSpaces(tokenDocument, movement),
-        method: movement.method,
-        authority: authority.name
-      });
+      this.#dispatchClientIntent(tokenDocument, intent);
       return false;
     } catch (error) {
       console.error(`${MODULE_ID} | Failed to intercept movement`, error);
       this.#notify("MRL.Notifications.Denied");
       return false;
     }
+  }
+
+  #dispatchClientIntent(tokenDocument, intent, authoritativeOrigin = null) {
+    const resolved = this.#resolveClientIntent(
+      tokenDocument,
+      intent,
+      authoritativeOrigin
+    );
+    if (!resolved.waypoints.length) return;
+
+    const authority = game.users.activeGM;
+    if (!authority) {
+      this.#notify("MRL.Notifications.NoActiveGM");
+      this.#debug("movement request rejected on requesting client", {
+        token: tokenDocument.name,
+        reason: "no active GM"
+      });
+      return;
+    }
+
+    const requestId = foundry.utils.randomID();
+    const key = this.#tokenKey(intent.sceneId, intent.tokenId);
+    const request = {
+      type: "move-request",
+      requestId,
+      userId: game.user.id,
+      sceneId: intent.sceneId,
+      tokenId: intent.tokenId,
+      // The movement operation's origin may refer to an earlier history chain.
+      // The source document position is the only safe concurrency anchor.
+      origin: resolved.origin,
+      waypoints: resolved.waypoints,
+      autoRotate: Boolean(intent.autoRotate),
+      requestedMethod: intent.requestedMethod
+    };
+
+    const timeout = globalThis.setTimeout(() => {
+      const pending = this.#clientMoves.get(key);
+      if (pending?.requestId !== requestId) return;
+      this.#finishClientMove(request, key, true);
+      this.#notify("MRL.Notifications.Denied");
+    }, this.#timings.clientRequestTimeoutMs);
+    this.#clientMoves.set(key, {
+      requestId,
+      timeout,
+      status: "pending",
+      queuedIntent: null
+    });
+
+    if (authority.id === game.user.id) {
+      queueMicrotask(() => void this.#handleMoveRequest(request));
+    } else {
+      game.socket.emit(SOCKET_CHANNEL, request);
+    }
+
+    this.#debug("movement request intercepted", {
+      token: tokenDocument.name,
+      requestedDistance: this.#measureRequestedGridSpaces(
+        tokenDocument,
+        request.origin,
+        request.waypoints.at(-1)
+      ),
+      method: intent.requestedMethod,
+      authority: authority.name,
+      effectiveSpeed: Settings.speedForToken(tokenDocument)
+    });
+  }
+
+  #captureClientIntent(tokenDocument, movement, waypoints) {
+    const sceneId = tokenDocument.parent?.id;
+    const tokenId = tokenDocument.id;
+    const documentOrigin = currentPosition(tokenDocument);
+    const movementOrigin = this.#materializePosition(
+      movement?.origin,
+      documentOrigin
+    );
+    const destinationSource = sanitizeWaypoint(waypoints.at(-1));
+    const destination = this.#materializePosition(
+      destinationSource,
+      movementOrigin
+    );
+    if (!sceneId || !tokenId || !movementOrigin || !destination) return null;
+
+    const common = {
+      sceneId,
+      tokenId,
+      autoRotate: Boolean(movement.autoRotate),
+      requestedMethod: movement.method
+    };
+    const metadata = this.#waypointMetadata(destinationSource);
+
+    if (movement.method === "keyboard") {
+      return {
+        ...common,
+        mode: "relative",
+        delta: {
+          x: destination.x - movementOrigin.x,
+          y: destination.y - movementOrigin.y,
+          elevation: destination.elevation - movementOrigin.elevation
+        },
+        level:
+          destinationSource?.level !== undefined
+            ? destinationSource.level
+            : undefined,
+        metadata
+      };
+    }
+
+    if (movement.method === "hud") {
+      return {
+        ...common,
+        mode: "hud",
+        elevation:
+          destinationSource?.elevation !== undefined
+            ? destination.elevation
+            : undefined,
+        level:
+          destinationSource?.level !== undefined
+            ? destinationSource.level
+            : undefined,
+        metadata
+      };
+    }
+
+    return {
+      ...common,
+      mode: "absolute",
+      capturedOrigin: movementOrigin,
+      waypoints: waypoints.map((waypoint) => ({ ...waypoint })),
+      destination,
+      metadata
+    };
+  }
+
+  #resolveClientIntent(tokenDocument, intent, authoritativeOrigin = null) {
+    const documentOrigin = currentPosition(tokenDocument);
+    const origin =
+      (authoritativeOrigin
+        ? this.#materializePosition(authoritativeOrigin, documentOrigin)
+        : null) ?? documentOrigin;
+    let waypoints;
+
+    if (intent.mode === "relative") {
+      const destination = {
+        ...origin,
+        ...intent.metadata,
+        x: origin.x + intent.delta.x,
+        y: origin.y + intent.delta.y,
+        elevation: origin.elevation + intent.delta.elevation
+      };
+      if (intent.level !== undefined) destination.level = intent.level;
+      waypoints = [destination];
+    } else if (intent.mode === "hud") {
+      const destination = { ...origin, ...intent.metadata };
+      if (intent.elevation !== undefined) {
+        destination.elevation = intent.elevation;
+      }
+      if (intent.level !== undefined) destination.level = intent.level;
+      waypoints = [destination];
+    } else {
+      const originUnchanged = sameSpatialPosition(
+        origin,
+        intent.capturedOrigin,
+        POSITION_EPSILON_PX
+      );
+      // Old drag-ruler intermediates are unsafe after another move. Foundry
+      // will constrain a fresh direct path from the new origin to the same
+      // absolute destination on the authority.
+      waypoints = originUnchanged
+        ? intent.waypoints
+        : [{ ...intent.destination, ...intent.metadata }];
+    }
+
+    const materialized = [];
+    let from = origin;
+    for (const waypoint of waypoints ?? []) {
+      const resolved = this.#materializePosition(waypoint, from);
+      if (!resolved) continue;
+      if (!sameSpatialPosition(from, resolved, 0.01)) {
+        materialized.push(resolved);
+      }
+      from = resolved;
+    }
+    return { origin, waypoints: deduplicateWaypoints(materialized) };
+  }
+
+  #materializePosition(waypoint, fallback) {
+    const clean = sanitizeWaypoint(waypoint) ?? {};
+    const position = {
+      ...fallback,
+      ...clean,
+      x: Number(clean.x ?? fallback?.x),
+      y: Number(clean.y ?? fallback?.y),
+      elevation: Number(clean.elevation ?? fallback?.elevation ?? 0)
+    };
+    if (
+      !Number.isFinite(position.x) ||
+      !Number.isFinite(position.y) ||
+      !Number.isFinite(position.elevation)
+    ) {
+      return null;
+    }
+    return position;
+  }
+
+  #waypointMetadata(waypoint) {
+    const metadata = {};
+    for (const field of ["action", "snapped", "explicit", "checkpoint"]) {
+      if (waypoint?.[field] !== undefined) metadata[field] = waypoint[field];
+    }
+    return metadata;
   }
 
   async #onSocketMessage(message) {
@@ -238,7 +453,10 @@ export class MovementLimiter {
       userId: request.userId,
       abort: false,
       abortReason: null,
-      heartbeat: null
+      heartbeat: null,
+      controller: new AbortController(),
+      currentMovementId: null,
+      currentDestination: null
     };
     this.#activeMoves.set(key, state);
     this.#sendStatus(request, "accepted");
@@ -249,14 +467,19 @@ export class MovementLimiter {
         return;
       }
       this.#sendStatus(request, "active");
-    }, STATUS_HEARTBEAT_MS);
+    }, this.#timings.statusHeartbeatMs);
 
     try {
       const result = await this.#executeMovement(request, state);
+      const finalToken = this.#resolveToken(request.sceneId, request.tokenId);
       this.#sendStatus(
         request,
         result.completed ? "complete" : "stopped",
-        result.reason
+        result.reason,
+        {
+          movementId: result.movementId ?? null,
+          finalPosition: finalToken ? currentPosition(finalToken) : null
+        }
       );
     } catch (error) {
       console.error(`${MODULE_ID} | Movement execution failed`, error);
@@ -275,16 +498,23 @@ export class MovementLimiter {
     }
 
     let expected = currentPosition(token);
-    const path = this.#buildExecutionPath(token, request.waypoints);
-    const key = this.#tokenKey(request.sceneId, request.tokenId);
-    let movementDeadline =
-      this.#movementDeadlines.get(key) ?? MovementBucket.now();
+    const builtPath = this.#buildExecutionPath(token, request.waypoints);
+    if (builtPath.truncated) {
+      return { completed: false, reason: "path-too-long", movementId: null };
+    }
+    const path = builtPath.waypoints;
+    if (!path.length) {
+      return { completed: false, reason: "prevented", movementId: null };
+    }
+    // The pacing deadline belongs to this accepted request only. Busy/rejected
+    // clicks cannot mutate it, and a later request never inherits stale debt.
+    let movementDeadline = monotonicNow();
+    let finalMovementId = null;
 
     this.#debug("movement accepted", {
       token: token.name,
       pathWaypoints: path.length,
-      speed: Settings.speedForToken(token),
-      burst: Settings.maximumBurst
+      speed: Settings.speedForToken(token)
     });
 
     for (const waypoint of path) {
@@ -319,100 +549,215 @@ export class MovementLimiter {
       }
 
       const speed = Settings.speedForToken(token);
-      const bucket = this.#bucketFor(key, speed, Settings.maximumBurst);
       const cost = this.#measureGridSpaces(token, expected, waypoint);
-      const segmentRequestedAt = MovementBucket.now();
-      const waitMs = bucket.delayFor(cost, segmentRequestedAt);
-      const before = bucket.snapshot();
 
       this.#debug("movement segment evaluated", {
         token: token.name,
         requestedDistance: cost,
-        available: before.available,
-        elapsed: before.elapsedSeconds,
-        waitMs,
-        allowedMovement: cost
+        allowedMovement: cost,
+        effectiveSpeed: speed
       });
 
-      if (waitMs > 0) await this.#delay(waitMs, state);
-      if (state.abort) break;
-
-      token = this.#resolveToken(request.sceneId, request.tokenId);
-      if (
-        !token ||
-        !Settings.isTokenRestricted(token, user) ||
-        game.paused ||
-        !sameSpatialPosition(
-          currentPosition(token),
-          expected,
-          POSITION_EPSILON_PX
-        )
-      ) {
-        this.#abort(
-          state,
-          game.paused
-            ? "paused"
-            : !token
-              ? "unavailable"
-              : !Settings.isTokenRestricted(token, user)
-                ? "state-changed"
-                : "stale"
-        );
-        break;
-      }
-
-      bucket.configure(speed, Settings.maximumBurst);
-      const startedAt = MovementBucket.now();
-      const timing = scheduleSegmentExecution(
-        movementDeadline,
-        cost,
-        speed,
-        segmentRequestedAt,
-        startedAt
-      );
+      const startedAt = monotonicNow();
+      const timing = scheduleSegment(movementDeadline, cost, speed, startedAt);
       movementDeadline = timing.deadline;
-      // Bucket delay and animation share one deadline. Waiting for allowance
-      // consumes part of the visual duration instead of stacking on top of it.
       const durationMs = timing.durationMs;
+      const movementId = foundry.utils.randomID();
       const moveOptions = {
+        id: movementId,
         method: "api",
         autoRotate: request.autoRotate,
         showRuler: false,
+        pan: false,
         animate: durationMs > 0,
         animation: {
           duration: durationMs,
-          linkToMovement: true,
-          movementSpeed: animationSpeedForDuration(cost, durationMs, speed)
+          linkToMovement: true
         }
       };
-      const moved = await token.move(waypoint, moveOptions);
+      const moveResult = await this.#moveSegmentWithinDeadline(
+        token,
+        waypoint,
+        moveOptions,
+        timing.deadline,
+        state
+      );
+      if (moveResult.movementId) {
+        finalMovementId = moveResult.movementId;
+      }
 
-      if (!moved) {
+      if (!moveResult.moved) {
         this.#debug("movement segment rejected by Foundry", {
           token: token.name,
-          waypoint
+          waypoint,
+          reason: moveResult.reason
         });
-        this.#abort(state, "prevented");
+        this.#abort(state, moveResult.reason ?? "prevented");
         break;
       }
 
-      // Only a movement that Foundry actually accepted advances the persistent
-      // schedule or spends allowance. Passing startedAt records the debit at
-      // the instant movement began, so animation time still regenerates the
-      // bucket normally. Rejected clicks and busy-token retries change neither.
-      bucket.consume(cost, startedAt);
-      this.#movementDeadlines.set(key, movementDeadline);
+      finalMovementId ??= movementId;
       expected = currentPosition(token);
-      const remainingMs = movementDeadline - MovementBucket.now();
-      if (remainingMs > 0) {
-        await this.#delay(remainingMs, state);
-      }
+      await delayUntil(movementDeadline, {
+        signal: state.controller.signal
+      });
     }
 
     return {
       completed: !state.abort,
-      reason: state.abortReason
+      reason: state.abortReason,
+      movementId: finalMovementId
     };
+  }
+
+  async #moveSegmentWithinDeadline(
+    token,
+    waypoint,
+    moveOptions,
+    segmentDeadline,
+    state
+  ) {
+    state.currentDestination = this.#materializePosition(
+      waypoint,
+      currentPosition(token)
+    );
+    state.currentMovementId = null;
+
+    let movePromise;
+    try {
+      movePromise = Promise.resolve(token.move(waypoint, moveOptions));
+    } catch (error) {
+      state.currentDestination = null;
+      throw error;
+    }
+
+    this.#captureCurrentMovementId(token, state);
+    // Foundry's promise includes document-update bookkeeping in addition to
+    // the configured animation. Give that bookkeeping a bounded chance to
+    // settle; the cumulative pacing deadline itself is not extended by it.
+    const timeoutMs =
+      Math.max(0, segmentDeadline - monotonicNow()) +
+      this.#timings.moveSettleGraceMs;
+    const outcome = await settleWithin(movePromise, timeoutMs, {
+      signal: state.controller.signal
+    });
+
+    if (outcome.status === "fulfilled") {
+      const movementId = state.currentMovementId;
+      state.currentDestination = null;
+      state.currentMovementId = null;
+      return {
+        moved: Boolean(outcome.value),
+        reason: outcome.value ? null : "prevented",
+        movementId
+      };
+    }
+    if (outcome.status === "rejected") {
+      state.currentDestination = null;
+      state.currentMovementId = null;
+      throw outcome.error;
+    }
+
+    const current = this.#resolveToken(state.sceneId, state.tokenId);
+    this.#captureCurrentMovementId(current, state);
+    const movementId = state.currentMovementId;
+    const shouldStop = this.#isCurrentMovementOwned(
+      current,
+      state,
+      moveOptions.id
+    );
+    if (current && shouldStop) {
+      try {
+        const stopped = current.stopMovement();
+        this.#debug("movement deadline cleanup", {
+          token: state.tokenId,
+          movementId,
+          stopped
+        });
+      } catch (error) {
+        this.#debug("failed to stop timed-out movement", {
+          token: state.tokenId,
+          error
+        });
+      }
+    }
+
+    const reachedDestination =
+      outcome.status === "timeout" &&
+      shouldStop &&
+      state.currentDestination &&
+      sameSpatialPosition(
+        currentPosition(current),
+        state.currentDestination,
+        POSITION_EPSILON_PX
+      );
+
+    state.currentDestination = null;
+    state.currentMovementId = null;
+
+    return {
+      moved: Boolean(reachedDestination),
+      reason: reachedDestination
+        ? null
+        : outcome.status === "timeout"
+          ? "timeout"
+          : state.abortReason,
+      movementId
+    };
+  }
+
+  #captureCurrentMovementId(token, state) {
+    const movement = token?.movement;
+    if (!movement || movement.method !== "api" || !state.currentDestination) {
+      return;
+    }
+    const initiatingUserId = movement.user?.id ?? movement.user;
+    const sameDestination = sameSpatialPosition(
+      movement.destination,
+      state.currentDestination,
+      POSITION_EPSILON_PX
+    );
+    if (
+      !sameDestination &&
+      (!initiatingUserId || initiatingUserId !== game.user.id)
+    ) {
+      return;
+    }
+    state.currentMovementId = movement.id ?? state.currentMovementId;
+    state.currentDestination =
+      this.#materializePosition(
+        movement.destination,
+        state.currentDestination
+      ) ?? state.currentDestination;
+  }
+
+  #isCurrentMovementOwned(token, state, requestedMovementId) {
+    if (!token) return false;
+    const movement = token?.movement;
+    if (!movement?.id && !movement?.method) return true;
+    if (
+      state.currentMovementId &&
+      movement?.id === state.currentMovementId
+    ) {
+      return true;
+    }
+    if (movement?.id === requestedMovementId) return true;
+    const initiatingUserId = movement?.user?.id ?? movement?.user;
+    if (
+      movement?.method === "api" &&
+      initiatingUserId === game.user.id
+    ) {
+      return true;
+    }
+    return (
+      movement?.method === "api" &&
+      state.currentDestination &&
+      sameSpatialPosition(
+        movement.destination,
+        state.currentDestination,
+        POSITION_EPSILON_PX
+      )
+    );
   }
 
   #buildExecutionPath(token, requestedWaypoints) {
@@ -445,10 +790,6 @@ export class MovementLimiter {
 
     const result = [];
     let from = origin;
-    // Segment size is an execution/detail concern, not bucket capacity. The
-    // bucket explicitly supports an indivisible segment exceeding its burst by
-    // creating debt. Tying these together creates tiny fractional updates when
-    // burst is low and makes Foundry update overhead dominate movement speed.
     const maximumSegmentCost = MAX_SEGMENT_GRID_SPACES;
     for (const to of expanded) {
       const cost = this.#measureGridSpaces(token, from, to);
@@ -456,16 +797,16 @@ export class MovementLimiter {
         from,
         to,
         cost,
-        maximumSegmentCost
+        maximumSegmentCost,
+        MAX_EXECUTION_WAYPOINTS - result.length
       );
+      if (!parts) return { waypoints: [], truncated: true };
       for (const part of parts) {
-        if (result.length >= MAX_EXECUTION_WAYPOINTS) break;
         result.push(part);
       }
-      if (result.length >= MAX_EXECUTION_WAYPOINTS) break;
       from = to;
     }
-    return deduplicateWaypoints(result);
+    return { waypoints: deduplicateWaypoints(result), truncated: false };
   }
 
   #measureGridSpaces(token, from, to) {
@@ -478,29 +819,12 @@ export class MovementLimiter {
       const measurement = token.measureMovementPath([from, to]);
       const gridless =
         Number(grid?.type) === Number(CONST.GRID_TYPES.GRIDLESS);
-
-      if (
-        !gridless &&
-        Number.isFinite(measurement.cost) &&
-        measurement.cost > 0 &&
-        gridDistance > 0
-      ) {
-        return measurement.cost / gridDistance;
-      }
-      if (
-        !gridless &&
-        Number.isFinite(measurement.distance) &&
-        measurement.distance > 0 &&
-        gridDistance > 0
-      ) {
-        return measurement.distance / gridDistance;
-      }
-      if (Number.isFinite(measurement.spaces) && measurement.spaces > 0) {
-        return measurement.spaces;
-      }
-      if (Number.isFinite(measurement.euclidean) && measurement.euclidean > 0) {
-        return measurement.euclidean / gridSize;
-      }
+      const measured = measuredGridSpaces(measurement, {
+        gridless,
+        gridSize,
+        gridDistance
+      });
+      if (measured !== null) return measured;
     } catch (error) {
       this.#debug("Foundry path measurement failed; using pixel fallback", {
         token: token.name,
@@ -519,28 +843,18 @@ export class MovementLimiter {
   }
 
   #movementGridSpaces(token, movement) {
-    const gridDistance = Math.max(0, Number(token.parent?.grid?.distance) || 0);
-    const cost = Number(movement?.pending?.cost);
-    if (Number.isFinite(cost) && cost > 0 && gridDistance > 0) {
-      return cost / gridDistance;
-    }
-    const distance = Number(movement?.pending?.distance);
-    if (Number.isFinite(distance) && distance > 0 && gridDistance > 0) {
-      return distance / gridDistance;
-    }
-    const spaces = Number(movement?.pending?.spaces);
-    return Number.isFinite(spaces) ? spaces : null;
+    const grid = token.parent?.grid;
+    return measuredGridSpaces(movement?.pending, {
+      gridless:
+        Number(grid?.type) === Number(CONST.GRID_TYPES.GRIDLESS),
+      gridSize: grid?.size,
+      gridDistance: grid?.distance
+    });
   }
 
-  #bucketFor(key, speed, burst) {
-    let bucket = this.#buckets.get(key);
-    if (!bucket) {
-      bucket = new MovementBucket(speed, burst);
-      this.#buckets.set(key, bucket);
-    } else {
-      bucket.configure(speed, burst);
-    }
-    return bucket;
+  #measureRequestedGridSpaces(token, from, to) {
+    if (!from || !to) return null;
+    return this.#measureGridSpaces(token, from, to);
   }
 
   #handleMoveStatus(message) {
@@ -555,53 +869,68 @@ export class MovementLimiter {
       pending.timeout = globalThis.setTimeout(() => {
         const active = this.#clientMoves.get(key);
         if (active?.requestId !== message.requestId) return;
-        this.#clientMoves.delete(key);
+        this.#finishClientMove(message, key, true);
         this.#notify("MRL.Notifications.Denied");
-      }, CLIENT_ACTIVE_TIMEOUT_MS);
+      }, this.#timings.clientActiveTimeoutMs);
       return;
     }
 
     globalThis.clearTimeout(pending.timeout);
     if (message.status === "complete") {
-      pending.status = "finishing";
-      void this.#releaseAfterLocalAnimation(message, key);
+      // Authority completion already occurs at the configured movement
+      // deadline. Never stack a second client-side animation grace period.
+      this.#finishClientMove(message, key, true);
       return;
     }
 
-    this.#clientMoves.delete(key);
     if (message.status === "rejected" || message.status === "stopped") {
+      const replayQueued = [
+        "busy",
+        "prevented",
+        "stale",
+        "timeout",
+        "error"
+      ].includes(message.reason);
+      this.#finishClientMove(message, key, replayQueued);
       if (["combat", "state-changed"].includes(message.reason)) return;
-      const notificationKey =
-        message.reason === "stale"
-          ? "MRL.Notifications.Stale"
-          : message.reason === "paused"
-            ? "MRL.Notifications.Paused"
-            : "MRL.Notifications.Limited";
-      this.#notify(notificationKey);
-    }
-  }
-
-  async #releaseAfterLocalAnimation(message, key) {
-    const token = this.#resolveToken(message.sceneId, message.tokenId);
-    const animation = token?.object?.movementAnimationPromise;
-    if (animation && typeof animation.then === "function") {
-      try {
-        await animation;
-      } catch (error) {
-        this.#debug("local movement animation ended with an error", {
-          token: message.tokenId,
-          error
-        });
+      let notificationKey;
+      if (message.reason === "stale") {
+        notificationKey = "MRL.Notifications.Stale";
+      } else if (message.reason === "paused") {
+        notificationKey = "MRL.Notifications.Paused";
+      } else if (["busy", "prevented"].includes(message.reason)) {
+        notificationKey = "MRL.Notifications.Limited";
+      } else {
+        notificationKey = "MRL.Notifications.Denied";
       }
+      this.#notify(notificationKey);
+      return;
     }
 
-    const pending = this.#clientMoves.get(key);
-    if (pending?.requestId === message.requestId) {
-      this.#clientMoves.delete(key);
-    }
+    this.#finishClientMove(message, key, false);
   }
 
-  #sendStatus(request, status, reason = null) {
+  #finishClientMove(message, key, runQueuedIntent) {
+    const pending = this.#clientMoves.get(key);
+    if (!pending || pending.requestId !== message.requestId) return;
+
+    const queuedIntent = runQueuedIntent ? pending.queuedIntent : null;
+    globalThis.clearTimeout(pending.timeout);
+    this.#clientMoves.delete(key);
+
+    if (!queuedIntent) return;
+    queueMicrotask(() => {
+      if (this.#clientMoves.has(key)) return;
+      const token = this.#resolveToken(
+        queuedIntent.sceneId,
+        queuedIntent.tokenId
+      );
+      if (!token || !Settings.isTokenRestricted(token, game.user)) return;
+      this.#dispatchClientIntent(token, queuedIntent, message.finalPosition);
+    });
+  }
+
+  #sendStatus(request, status, reason = null, details = {}) {
     const message = {
       type: "move-status",
       requestId: request.requestId,
@@ -609,7 +938,8 @@ export class MovementLimiter {
       sceneId: request.sceneId,
       tokenId: request.tokenId,
       status,
-      reason
+      reason,
+      ...details
     };
 
     if (request.userId === game.user.id) this.#handleMoveStatus(message);
@@ -625,23 +955,29 @@ export class MovementLimiter {
   }
 
   #notify(localizationKey) {
-    if (!Settings.showNotification) return;
-    const now = Date.now();
-    if (now - this.#lastNotificationAt < NOTIFICATION_COOLDOWN_MS) return;
-    this.#lastNotificationAt = now;
+    if (localizationKey === "MRL.Notifications.Limited") {
+      if (!Settings.showNotification) return;
+      const now = Date.now();
+      if (now - this.#lastNotificationAt < NOTIFICATION_COOLDOWN_MS) return;
+      this.#lastNotificationAt = now;
+    }
     ui.notifications.info(game.i18n.localize(localizationKey));
   }
 
   #validRequestShape(request) {
+    const origin = sanitizeWaypoint(request.origin);
     return (
       typeof request.requestId === "string" &&
       typeof request.userId === "string" &&
       typeof request.sceneId === "string" &&
       typeof request.tokenId === "string" &&
-      request.origin &&
+      origin &&
+      Number.isFinite(origin.x) &&
+      Number.isFinite(origin.y) &&
       Array.isArray(request.waypoints) &&
       request.waypoints.length > 0 &&
-      request.waypoints.length <= MAX_SOCKET_WAYPOINTS
+      request.waypoints.length <= MAX_SOCKET_WAYPOINTS &&
+      request.waypoints.every((waypoint) => sanitizeWaypoint(waypoint))
     );
   }
 
@@ -674,41 +1010,27 @@ export class MovementLimiter {
   }
 
   #pruneRuntimeState() {
-    for (const key of this.#buckets.keys()) {
+    for (const [key, pending] of this.#clientMoves) {
       const separator = key.indexOf(".");
       const sceneId = key.slice(0, separator);
       const tokenId = key.slice(separator + 1);
-      if (!this.#resolveToken(sceneId, tokenId)) this.#buckets.delete(key);
+      if (this.#resolveToken(sceneId, tokenId)) continue;
+      globalThis.clearTimeout(pending.timeout);
+      this.#clientMoves.delete(key);
     }
-    for (const key of this.#movementDeadlines.keys()) {
-      const separator = key.indexOf(".");
-      const sceneId = key.slice(0, separator);
-      const tokenId = key.slice(separator + 1);
-      if (!this.#resolveToken(sceneId, tokenId)) {
-        this.#movementDeadlines.delete(key);
+    for (const state of this.#activeMoves.values()) {
+      if (!this.#resolveToken(state.sceneId, state.tokenId)) {
+        this.#abort(state, "unavailable");
       }
     }
     this.#pruneRecentRequests();
   }
 
-  #deleteKeysWithPrefix(map, prefix) {
-    for (const key of map.keys()) {
-      if (key.startsWith(prefix)) map.delete(key);
-    }
-  }
-
   #abort(state, reason) {
+    if (state.abort) return;
     state.abort = true;
     state.abortReason ??= reason;
-  }
-
-  async #delay(durationMs, state) {
-    let remaining = Math.max(0, durationMs);
-    while (remaining > 0 && !state.abort) {
-      const slice = Math.min(remaining, 250);
-      await new Promise((resolve) => globalThis.setTimeout(resolve, slice));
-      remaining -= slice;
-    }
+    state.controller?.abort(reason);
   }
 
   #debugRejected(token, movement, reason) {
