@@ -124,6 +124,16 @@ export function minimumSegmentDurationMs(cost, speed) {
   return (normalizedCost / normalizedSpeed) * 1000;
 }
 
+export function animationSpeedForDuration(cost, durationMs, fallbackSpeed) {
+  const normalizedCost = Math.max(0, Number(cost) || 0);
+  const normalizedDuration = Math.max(0, Number(durationMs) || 0);
+  const normalizedFallback = Math.max(0.01, Number(fallbackSpeed) || 0.01);
+  if (normalizedCost === 0 || normalizedDuration === 0) {
+    return normalizedFallback;
+  }
+  return normalizedCost / (normalizedDuration / 1000);
+}
+
 /**
  * Schedule a segment against a cumulative movement deadline.
  *

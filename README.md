@@ -63,7 +63,7 @@ Open **Game Settings → Configure Settings → Module Settings**.
 | Maximum Burst | 2 squares | Maximum stored allowance per token |
 | Restricted Roles | Players only | Which Foundry role constants are restricted |
 | Disable During Combat | Enabled | Started combat encounters use normal Foundry movement |
-| Show Player Notification | Enabled | Shows throttled rejection feedback |
+| Show Movement-Limit Warnings | Enabled | Shows throttled warnings for movement that is too fast or otherwise rejected |
 | Debug Logging | Disabled | Logs path, allowance, elapsed time, waits, and decisions |
 
 Settings are world settings and changes take effect without restarting Foundry.
@@ -98,7 +98,8 @@ socket and document-update overhead shortens later animations instead of being
 added to the configured travel time once per segment. The deadline is retained
 per token between separate movement requests. Clicking again therefore never
 restarts a full movement interval; only the portion that has not elapsed can
-still delay the next movement.
+still delay the next movement. The requesting client keeps the token busy until
+its final local movement animation has finished, then releases it immediately.
 
 Foundry's measured path cost is divided by the scene's configured distance per
 grid space. A 5 ft grid and a 1.5 m grid therefore both count one orthogonal

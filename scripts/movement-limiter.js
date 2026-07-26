@@ -14,6 +14,7 @@ import {
 } from "./constants.js";
 import { MovementBucket } from "./movement-bucket.js";
 import {
+  animationSpeedForDuration,
   currentPosition,
   deduplicateWaypoints,
   movementWaypoints,
@@ -376,7 +377,8 @@ export class MovementLimiter {
         animate: durationMs > 0,
         animation: {
           duration: durationMs,
-          linkToMovement: true
+          linkToMovement: true,
+          movementSpeed: animationSpeedForDuration(cost, durationMs, speed)
         }
       };
       const moved = await token.move(waypoint, moveOptions);
@@ -556,6 +558,12 @@ export class MovementLimiter {
     }
 
     globalThis.clearTimeout(pending.timeout);
+    if (message.status === "complete") {
+      pending.status = "finishing";
+      void this.#releaseAfterLocalAnimation(message, key);
+      return;
+    }
+
     this.#clientMoves.delete(key);
     if (message.status === "rejected" || message.status === "stopped") {
       if (["combat", "state-changed"].includes(message.reason)) return;
@@ -566,6 +574,26 @@ export class MovementLimiter {
             ? "MRL.Notifications.Paused"
             : "MRL.Notifications.Limited";
       this.#notify(notificationKey);
+    }
+  }
+
+  async #releaseAfterLocalAnimation(message, key) {
+    const token = this.#resolveToken(message.sceneId, message.tokenId);
+    const animation = token?.object?.movementAnimationPromise;
+    if (animation && typeof animation.then === "function") {
+      try {
+        await animation;
+      } catch (error) {
+        this.#debug("local movement animation ended with an error", {
+          token: message.tokenId,
+          error
+        });
+      }
+    }
+
+    const pending = this.#clientMoves.get(key);
+    if (pending?.requestId === message.requestId) {
+      this.#clientMoves.delete(key);
     }
   }
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  animationSpeedForDuration,
   minimumSegmentDurationMs,
   scheduleSegment,
   splitSegmentByCost
@@ -31,6 +32,12 @@ test("two squares per second requires at least half a second per square", () => 
 
 test("small segments are not slowed by an artificial duration floor", () => {
   assert.equal(minimumSegmentDurationMs(0.1, 20), 5);
+});
+
+test("animation speed is adjusted to the scheduled duration", () => {
+  assert.equal(animationSpeedForDuration(1, 500, 2), 2);
+  assert.equal(animationSpeedForDuration(1, 250, 2), 4);
+  assert.equal(animationSpeedForDuration(1, 0, 2), 2);
 });
 
 test("cumulative pacing recovers per-segment execution overhead", () => {
