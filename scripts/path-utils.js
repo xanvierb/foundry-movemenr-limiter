@@ -148,17 +148,57 @@ export function scheduleSegment(deadlineMs, cost, speed, now) {
     ? Number(deadlineMs)
     : currentTime;
   const segmentDurationMs = minimumSegmentDurationMs(cost, speed);
-  const accumulatedDeadline = previousDeadline + segmentDurationMs;
-  // Recover ordinary per-update overhead while the schedule is still current,
-  // but never turn a stale deadline into a zero-duration token jump. After an
-  // idle gap (or unusually large delay), begin a fresh visible animation.
-  const deadline =
-    accumulatedDeadline > currentTime
-      ? accumulatedDeadline
-      : currentTime + segmentDurationMs;
+  const maximumDeadline = currentTime + segmentDurationMs;
+  let deadline;
+  if (previousDeadline > currentTime) {
+    // A movement attempt made before the existing deadline only waits for the
+    // remaining time. Never append a new full interval to that deadline.
+    deadline = Math.min(previousDeadline, maximumDeadline);
+  } else {
+    const accumulatedDeadline = previousDeadline + segmentDurationMs;
+    // Recover ordinary update overhead while the schedule is still recent. If
+    // it has fully expired, start one fresh visible animation instead of a jump.
+    deadline =
+      accumulatedDeadline > currentTime
+        ? accumulatedDeadline
+        : maximumDeadline;
+  }
   return {
     deadline,
     durationMs: Math.max(0, deadline - currentTime)
+  };
+}
+
+/**
+ * Combine allowance waiting and animation under one segment deadline.
+ * The time spent waiting for bucket allowance is deducted from the animation,
+ * so the limiter never deliberately stacks both durations.
+ */
+export function scheduleSegmentExecution(
+  deadlineMs,
+  cost,
+  speed,
+  requestedAt,
+  movementStartedAt
+) {
+  const timing = scheduleSegment(deadlineMs, cost, speed, requestedAt);
+  const normalizedRequest = Number(requestedAt) || 0;
+  const normalizedStart = Math.max(
+    normalizedRequest,
+    Number(movementStartedAt) || 0
+  );
+  const segmentDurationMs = minimumSegmentDurationMs(cost, speed);
+  const allowanceWaitMs = Math.max(0, normalizedStart - normalizedRequest);
+  const maximumAnimationDurationMs = Math.max(
+    0,
+    segmentDurationMs - allowanceWaitMs
+  );
+  return {
+    deadline: timing.deadline,
+    durationMs: Math.min(
+      Math.max(0, timing.deadline - normalizedStart),
+      maximumAnimationDurationMs
+    )
   };
 }
 

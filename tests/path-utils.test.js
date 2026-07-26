@@ -5,6 +5,7 @@ import {
   animationSpeedForDuration,
   minimumSegmentDurationMs,
   scheduleSegment,
+  scheduleSegmentExecution,
   splitSegmentByCost
 } from "../scripts/path-utils.js";
 
@@ -63,6 +64,73 @@ test("a later movement only waits for the unelapsed part of its interval", () =>
 
   assert.equal(timing.deadline, 1000);
   assert.equal(timing.durationMs, 100);
+});
+
+test("a future deadline does not stack another movement interval", () => {
+  const timing = scheduleSegment(1000, 1, 2, 900);
+
+  assert.equal(timing.deadline, 1000);
+  assert.equal(timing.durationMs, 100);
+});
+
+test("a far-future legacy deadline is capped to one interval", () => {
+  const timing = scheduleSegment(5000, 1, 2, 900);
+
+  assert.equal(timing.deadline, 1400);
+  assert.equal(timing.durationMs, 500);
+});
+
+test("bucket waiting consumes animation time instead of stacking", () => {
+  const requestedAt = 1000;
+  const bucketWaitMs = 300;
+  const timing = scheduleSegmentExecution(
+    1000,
+    1,
+    2,
+    requestedAt,
+    requestedAt + bucketWaitMs
+  );
+
+  assert.equal(timing.durationMs, 200);
+  assert.equal(bucketWaitMs + timing.durationMs, 500);
+});
+
+test("allowance wait plus animation never exceeds one configured interval", () => {
+  const requestedAt = 10000;
+
+  for (const speed of [0.1, 0.5, 2, 6, 20]) {
+    for (const cost of [0.1, 0.5, 1, 1.5]) {
+      const intervalMs = minimumSegmentDurationMs(cost, speed);
+      const previousDeadlines = [
+        requestedAt - intervalMs * 10,
+        requestedAt - intervalMs / 2,
+        requestedAt,
+        requestedAt + intervalMs / 2,
+        requestedAt + intervalMs,
+        requestedAt + intervalMs * 10
+      ];
+      const allowanceWaits = [0, intervalMs / 4, intervalMs / 2, intervalMs];
+
+      for (const previousDeadline of previousDeadlines) {
+        for (const allowanceWaitMs of allowanceWaits) {
+          const timing = scheduleSegmentExecution(
+            previousDeadline,
+            cost,
+            speed,
+            requestedAt,
+            requestedAt + allowanceWaitMs
+          );
+          const totalLimiterTimeMs = allowanceWaitMs + timing.durationMs;
+          const roundingToleranceMs = Math.max(1e-9, intervalMs * 1e-12);
+          assert.ok(timing.durationMs >= 0);
+          assert.ok(
+            totalLimiterTimeMs <= intervalMs + roundingToleranceMs,
+            `${cost} spaces at ${speed}/s stacked to ${totalLimiterTimeMs}ms (limit ${intervalMs}ms)`
+          );
+        }
+      }
+    }
+  }
 });
 
 test("an expired token deadline starts a fresh visible animation", () => {

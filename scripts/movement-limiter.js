@@ -20,7 +20,7 @@ import {
   movementWaypoints,
   sameSpatialPosition,
   sanitizeWaypoint,
-  scheduleSegment,
+  scheduleSegmentExecution,
   splitSegmentByCost
 } from "./path-utils.js";
 import { Settings } from "./settings.js";
@@ -321,7 +321,8 @@ export class MovementLimiter {
       const speed = Settings.speedForToken(token);
       const bucket = this.#bucketFor(key, speed, Settings.maximumBurst);
       const cost = this.#measureGridSpaces(token, expected, waypoint);
-      const waitMs = bucket.delayFor(cost);
+      const segmentRequestedAt = MovementBucket.now();
+      const waitMs = bucket.delayFor(cost, segmentRequestedAt);
       const before = bucket.snapshot();
 
       this.#debug("movement segment evaluated", {
@@ -362,13 +363,16 @@ export class MovementLimiter {
 
       bucket.configure(speed, Settings.maximumBurst);
       const startedAt = MovementBucket.now();
-      const timing = scheduleSegment(
+      const timing = scheduleSegmentExecution(
         movementDeadline,
         cost,
         speed,
+        segmentRequestedAt,
         startedAt
       );
       movementDeadline = timing.deadline;
+      // Bucket delay and animation share one deadline. Waiting for allowance
+      // consumes part of the visual duration instead of stacking on top of it.
       const durationMs = timing.durationMs;
       const moveOptions = {
         method: "api",
