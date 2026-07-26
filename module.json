@@ -1,0 +1,36 @@
+{
+  "id": "movement-rate-limiter",
+  "title": "Movement Rate Limiter",
+  "description": "Rate-limits player-controlled token movement in real grid spaces over real elapsed time.",
+  "version": "1.0.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "14.365"
+  },
+  "authors": [
+    {
+      "name": "Movement Rate Limiter Contributors"
+    }
+  ],
+  "socket": true,
+  "license": "LICENSE",
+  "readme": "README.md",
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "styles": [
+    "styles/movement-rate-limiter.css"
+  ],
+  "languages": [
+    {
+      "lang": "en",
+      "name": "English",
+      "path": "lang/en.json"
+    },
+    {
+      "lang": "nl",
+      "name": "Nederlands",
+      "path": "lang/nl.json"
+    }
+  ]
+}
