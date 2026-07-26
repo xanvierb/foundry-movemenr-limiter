@@ -2,7 +2,7 @@
   "id": "movement-rate-limiter",
   "title": "Movement Rate Limiter",
   "description": "Rate-limits player-controlled token movement in real grid spaces over real elapsed time.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "compatibility": {
     "minimum": "13",
     "verified": "14.365"
@@ -33,5 +33,5 @@
       "path": "lang/nl.json"
     }
   ],
-  "download": "https://github.com/xanvierb/foundry-movemenr-limiter/archive/refs/tags/0.0.1.zip"
+  "download": "https://github.com/xanvierb/foundry-movemenr-limiter/archive/refs/tags/0.0.2.zip"
 }
