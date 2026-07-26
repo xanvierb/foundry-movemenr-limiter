@@ -33,5 +33,6 @@
       "path": "lang/nl.json"
     }
   ],
+  "manifest": "https://raw.githubusercontent.com/xanvierb/foundry-movemenr-limiter/refs/heads/main/module.json",
   "download": "https://github.com/xanvierb/foundry-movemenr-limiter/archive/refs/tags/0.0.2.zip"
 }

@@ -14,6 +14,10 @@ test("module manifest declares v13-v14 compatibility and existing entry files", 
   assert.equal(manifest.compatibility.minimum, "13");
   assert.match(manifest.compatibility.verified, /^14/);
   assert.equal(manifest.socket, true);
+  assert.equal(
+    manifest.manifest,
+    "https://raw.githubusercontent.com/xanvierb/foundry-movemenr-limiter/refs/heads/main/module.json"
+  );
 
   for (const relativePath of [
     ...manifest.esmodules,
