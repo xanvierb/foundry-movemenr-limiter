@@ -26,6 +26,7 @@ import { Settings } from "./settings.js";
 
 export class MovementLimiter {
   #buckets = new Map();
+  #movementDeadlines = new Map();
   #activeMoves = new Map();
   #clientMoves = new Map();
   #lastNotificationAt = 0;
@@ -81,6 +82,7 @@ export class MovementLimiter {
   onDeleteToken(tokenDocument) {
     const key = this.#tokenKey(tokenDocument.parent?.id, tokenDocument.id);
     this.#buckets.delete(key);
+    this.#movementDeadlines.delete(key);
     globalThis.clearTimeout(this.#clientMoves.get(key)?.timeout);
     this.#clientMoves.delete(key);
     const active = this.#activeMoves.get(key);
@@ -90,6 +92,7 @@ export class MovementLimiter {
   onDeleteScene(sceneDocument) {
     const prefix = `${sceneDocument.id}.`;
     this.#deleteKeysWithPrefix(this.#buckets, prefix);
+    this.#deleteKeysWithPrefix(this.#movementDeadlines, prefix);
     for (const [key, pending] of this.#clientMoves) {
       if (!key.startsWith(prefix)) continue;
       globalThis.clearTimeout(pending.timeout);
@@ -273,8 +276,8 @@ export class MovementLimiter {
     let expected = currentPosition(token);
     const path = this.#buildExecutionPath(token, request.waypoints);
     const key = this.#tokenKey(request.sceneId, request.tokenId);
-    let movementDeadline = MovementBucket.now();
-    let scheduledSpeed = null;
+    let movementDeadline =
+      this.#movementDeadlines.get(key) ?? MovementBucket.now();
 
     this.#debug("movement accepted", {
       token: token.name,
@@ -357,12 +360,7 @@ export class MovementLimiter {
       }
 
       bucket.configure(speed, Settings.maximumBurst);
-      bucket.consume(cost);
       const startedAt = MovementBucket.now();
-      if (scheduledSpeed !== speed) {
-        movementDeadline = startedAt;
-        scheduledSpeed = speed;
-      }
       const timing = scheduleSegment(
         movementDeadline,
         cost,
@@ -392,6 +390,12 @@ export class MovementLimiter {
         break;
       }
 
+      // Only a movement that Foundry actually accepted advances the persistent
+      // schedule or spends allowance. Passing startedAt records the debit at
+      // the instant movement began, so animation time still regenerates the
+      // bucket normally. Rejected clicks and busy-token retries change neither.
+      bucket.consume(cost, startedAt);
+      this.#movementDeadlines.set(key, movementDeadline);
       expected = currentPosition(token);
       const remainingMs = movementDeadline - MovementBucket.now();
       if (remainingMs > 0) {
@@ -643,6 +647,14 @@ export class MovementLimiter {
       const sceneId = key.slice(0, separator);
       const tokenId = key.slice(separator + 1);
       if (!this.#resolveToken(sceneId, tokenId)) this.#buckets.delete(key);
+    }
+    for (const key of this.#movementDeadlines.keys()) {
+      const separator = key.indexOf(".");
+      const sceneId = key.slice(0, separator);
+      const tokenId = key.slice(separator + 1);
+      if (!this.#resolveToken(sceneId, tokenId)) {
+        this.#movementDeadlines.delete(key);
+      }
     }
     this.#pruneRecentRequests();
   }

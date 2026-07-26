@@ -50,6 +50,21 @@ test("cumulative pacing recovers per-segment execution overhead", () => {
   assert.equal(now, idealDurationMs + overheadMs);
 });
 
+test("a later movement only waits for the unelapsed part of its interval", () => {
+  const priorDeadline = 500;
+  const timing = scheduleSegment(priorDeadline, 1, 2, 900);
+
+  assert.equal(timing.deadline, 1000);
+  assert.equal(timing.durationMs, 100);
+});
+
+test("an expired token deadline allows the next movement immediately", () => {
+  const timing = scheduleSegment(500, 1, 2, 1200);
+
+  assert.equal(timing.deadline, 1000);
+  assert.equal(timing.durationMs, 0);
+});
+
 test("five seconds at two squares per second commits no more than eleven boundaries", () => {
   const duration = minimumSegmentDurationMs(1, 2);
   const commitTimes = Array.from({ length: 30 }, (_, index) => index * duration);

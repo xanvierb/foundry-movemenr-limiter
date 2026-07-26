@@ -95,7 +95,10 @@ therefore favors smooth gradual movement over teleporting the whole burst.
 Foundry's per-movement animation options are used to match the visual
 interpolation to this pacing. Segment deadlines are cumulative, so normal
 socket and document-update overhead shortens later animations instead of being
-added to the configured travel time once per segment.
+added to the configured travel time once per segment. The deadline is retained
+per token between separate movement requests. Clicking again therefore never
+restarts a full movement interval; only the portion that has not elapsed can
+still delay the next movement.
 
 Foundry's measured path cost is divided by the scene's configured distance per
 grid space. A 5 ft grid and a 1.5 m grid therefore both count one orthogonal
