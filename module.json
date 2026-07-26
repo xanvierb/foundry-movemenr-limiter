@@ -32,5 +32,6 @@
       "name": "Nederlands",
       "path": "lang/nl.json"
     }
-  ]
+  ],
+  "download": "https://github.com/xanvierb/foundry-movemenr-limiter/archive/refs/tags/0.0.0.zip"
 }
